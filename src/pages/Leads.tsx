@@ -1,6 +1,7 @@
 import { useState, useEffect } from "react";
 import { supabase } from "@/integrations/supabase/client";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
 import { Input } from "@/components/ui/input";
@@ -29,6 +30,11 @@ export default function Leads() {
   const [loading, setLoading] = useState(true);
   const [analyzing, setAnalyzing] = useState(false);
   const [youtubeUrls, setYoutubeUrls] = useState("");
+  
+  // Bulk selection state
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const allSelected = leads.length > 0 && selectedIds.size === leads.length;
+  const anySelected = selectedIds.size > 0;
 
   const [sendDialogOpen, setSendDialogOpen] = useState(false);
   const [selectedLead, setSelectedLead] = useState<Lead | null>(null);
@@ -69,6 +75,153 @@ export default function Leads() {
     }
   };
 
+  const toggleSelectAll = () => {
+    if (allSelected) {
+      setSelectedIds(new Set());
+    } else {
+      setSelectedIds(new Set(leads.map(l => l.id)));
+    }
+  };
+
+  const toggleSelectOne = (id: string) => {
+    setSelectedIds(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  };
+
+  const moveSelectedToCampaigns = async () => {
+    if (!anySelected) return;
+    try {
+      const ids = Array.from(selectedIds);
+      const { error } = await supabase
+        .from('leads')
+        .update({ status: 'campaign' })
+        .in('id', ids);
+      if (error) throw error;
+      toast.success(`Moved ${ids.length} lead(s) to campaigns`);
+      setSelectedIds(new Set());
+      fetchLeads();
+    } catch (e: any) {
+      toast.error(e.message || 'Failed to move to campaigns');
+    }
+  };
+
+  const sendColdEmailsSelected = async () => {
+    const ids = Array.from(selectedIds);
+    if (ids.length === 0) {
+      toast.error('Select at least one lead');
+      return;
+    }
+    setBatchSending(true);
+    setBatchProgress({ sent: 0, total: ids.length });
+    try {
+      const { data: { user } } = await supabase.auth.getUser();
+      if (!user) {
+        toast.error('You must be logged in to send emails');
+        return;
+      }
+      const targets = leads.filter(l => ids.includes(l.id));
+      for (let i = 0; i < targets.length; i++) {
+        const t = targets[i];
+        try {
+          const { error: invokeError } = await supabase.functions.invoke('send-outreach-email', {
+            body: {
+              leadEmail: t.email,
+              leadName: t.name,
+              channelName: t.channel_name,
+              templateSubject: batchSubject,
+              templateBody: batchBody,
+            }
+          });
+          if (invokeError) throw invokeError;
+
+          await supabase.from('emails').insert([
+            {
+              user_id: user.id,
+              lead_id: t.id,
+              subject: batchSubject,
+              body: batchBody,
+              status: 'sent',
+              sent_at: new Date().toISOString(),
+            }
+          ]);
+
+          await supabase
+            .from('leads')
+            .update({ status: 'contacted', last_contacted: new Date().toISOString() })
+            .eq('id', t.id);
+        } catch (e) {
+          await supabase.from('emails').insert([
+            {
+              user_id: user.id,
+              lead_id: t.id,
+              subject: batchSubject,
+              body: batchBody,
+              status: 'failed',
+              error_message: (e as any)?.message || 'Unknown error',
+            }
+          ]);
+        } finally {
+          setBatchProgress({ sent: i + 1, total: targets.length });
+        }
+      }
+      toast.success(`Finished sending to ${targets.length} selected lead(s)`);
+      setSelectedIds(new Set());
+      fetchLeads();
+    } catch (error: any) {
+      toast.error(error.message || 'Batch send failed');
+    } finally {
+      setBatchSending(false);
+    }
+  };
+
+  const enrichSelectedWithAI = async () => {
+    const ids = Array.from(selectedIds);
+    if (ids.length === 0) {
+      toast.error('Select at least one lead');
+      return;
+    }
+    const targets = leads.filter(l => ids.includes(l.id) && l.youtube_url);
+    if (targets.length === 0) {
+      toast.error('Selected leads have no YouTube URLs');
+      return;
+    }
+    setAnalyzing(true);
+    try {
+      for (const t of targets) {
+        const { data, error } = await supabase.functions.invoke('analyze-youtube-channels', {
+          body: { urls: [t.youtube_url] }
+        });
+        if (error) throw error;
+        const enriched = (data as any)?.leads?.[0];
+        if (enriched) {
+          let lastPosted: string | null = null;
+          if (enriched.last_posted && enriched.last_posted !== 'Unknown' && enriched.last_posted !== 'recent estimate') {
+            const d = new Date(enriched.last_posted);
+            if (!isNaN(d.getTime())) lastPosted = d.toISOString();
+          }
+          await supabase
+            .from('leads')
+            .update({
+              email: enriched.email || t.email,
+              channel_name: enriched.channel_name ?? t.channel_name,
+              niche: enriched.niche ?? t.niche,
+              last_posted: lastPosted,
+              ability_to_pay_analysis: enriched.ability_to_pay_analysis ?? t.ability_to_pay_analysis,
+            })
+            .eq('id', t.id);
+        }
+      }
+      toast.success(`Enriched ${targets.length} lead(s)`);
+      fetchLeads();
+    } catch (e: any) {
+      toast.error(e.message || 'AI enrichment failed');
+    } finally {
+      setAnalyzing(false);
+    }
+  };
   const handleAnalyzeChannels = async () => {
     if (!youtubeUrls.trim()) {
       toast.error("Please paste YouTube channel URLs");
@@ -246,7 +399,10 @@ export default function Leads() {
   };
 
   const handleBatchSend = async () => {
-    const targets = newlyAddedLeads.length > 0 ? newlyAddedLeads : leads.filter(l => l.status === 'new');
+    const selectedArray = Array.from(selectedIds);
+    const targets = selectedArray.length > 0
+      ? leads.filter(l => selectedArray.includes(l.id)).map(l => ({ id: l.id, name: l.name, email: l.email, channel_name: l.channel_name }))
+      : (newlyAddedLeads.length > 0 ? newlyAddedLeads : leads.filter(l => l.status === 'new').map(l => ({ id: l.id, name: l.name, email: l.email, channel_name: l.channel_name })));
     if (targets.length === 0) {
       toast.error('No leads to send to');
       return;
@@ -375,7 +531,25 @@ export default function Leads() {
         </div>
       ) : (
         <div className="space-y-4">
-          <h2 className="text-xl font-semibold">Analyzed Leads ({leads.length})</h2>
+          <div className="flex flex-col gap-3">
+            <div className="flex items-center justify-between">
+              <h2 className="text-xl font-semibold">Analyzed Leads ({leads.length})</h2>
+              {leads.length > 0 && (
+                <div className="flex items-center gap-3">
+                  <div className="flex items-center gap-2">
+                    <Checkbox checked={allSelected} onCheckedChange={toggleSelectAll} id="select-all" />
+                    <Label htmlFor="select-all">Select all</Label>
+                  </div>
+                  <span className="text-sm text-muted-foreground">{selectedIds.size} selected</span>
+                  <Button variant="secondary" size="sm" onClick={moveSelectedToCampaigns} disabled={!anySelected}>Move to Campaigns</Button>
+                  <Button variant="secondary" size="sm" onClick={enrichSelectedWithAI} disabled={!anySelected || analyzing}>
+                    {analyzing ? (<><Loader2 className="mr-2 h-4 w-4 animate-spin" /> Enriching...</>) : 'AI Enrich'}
+                  </Button>
+                  <Button variant="default" size="sm" onClick={() => setBatchDialogOpen(true)} disabled={!anySelected}>Send Cold Emails</Button>
+                </div>
+              )}
+            </div>
+          </div>
           {newlyAddedLeads.length > 0 && (
             <Card>
               <CardContent className="p-6">
@@ -403,7 +577,9 @@ export default function Leads() {
                 <Card key={lead.id} className="hover:shadow-elevated transition-all">
                   <CardContent className="p-6">
                     <div className="flex justify-between items-start gap-4">
-                      <div className="flex-1 space-y-3">
+                      <div className="flex items-start gap-3 w-full">
+                        <Checkbox checked={selectedIds.has(lead.id)} onCheckedChange={() => toggleSelectOne(lead.id)} />
+                        <div className="flex-1 space-y-3">
                         <div className="flex items-center gap-3">
                           <h3 className="text-lg font-semibold">{lead.name}</h3>
                           <Badge variant="outline">{lead.status}</Badge>
@@ -450,6 +626,7 @@ export default function Leads() {
                             View Channel →
                           </a>
                         )}
+                        </div>
                       </div>
 
                       <div className="flex items-center gap-2">
