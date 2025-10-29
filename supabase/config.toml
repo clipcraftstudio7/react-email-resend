@@ -1,0 +1,14 @@
+project_id = "cfhfupfkasyxtradcnwe"
+
+[auth]
+enabled = true
+site_url = "http://localhost:5173"
+
+[functions.send-email]
+verify_jwt = false
+
+[functions.analyze-youtube-channels]
+verify_jwt = false
+
+[functions.send-outreach-email]
+verify_jwt = false
