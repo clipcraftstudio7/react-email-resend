@@ -47,7 +47,7 @@ export default function Leads() {
   // Batch sending state after analysis
   const [newlyAddedLeads, setNewlyAddedLeads] = useState<Pick<Lead, 'id' | 'name' | 'email' | 'channel_name'>[]>([]);
   const [batchDialogOpen, setBatchDialogOpen] = useState(false);
-  const [batchSubject, setBatchSubject] = useState("Quick question about your channel, {name}");
+  const [batchSubject, setBatchSubject] = useState("Try a Free Video Edit? {name}");
   const [batchBody, setBatchBody] = useState(
     "Hey {name},\n\nI help creators like you at {channel_name} save 5-10 hours/week with editing. Would you be open to a quick call to see if I can help streamline your workflow?\n\n– Your Name"
   );
@@ -294,6 +294,9 @@ export default function Leads() {
         setNewlyAddedLeads(inserted || []);
         setYoutubeUrls("");
         fetchLeads();
+        setBatchSubject("Try a Free Video Edit? {name}");
+        setBatchBody(FREE_SAMPLE_BODY);
+        setBatchDialogOpen(true); // auto-open after leads added
       } else {
         toast.error("No leads found in analysis");
       }
